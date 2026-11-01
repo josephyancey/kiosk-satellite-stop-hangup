@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 1,
+  "id": "stop-hangup",
+  "name": "Stop Hangs Up Calls",
+  "version": "1.0.0",
+  "minAndroidSdk": 24,
+  "minAppVersion": "2026.10.45",
+  "entryClass": "dev.yancey.stophangup.StopHangupPlugin",
+  "description": "Say \"stop\" during an intercom call to hang it up. While a call is placed, live or announcing, it has the kiosk listen for the stop word, and hangs up when it hears it. Needs Stop word interruption on (Voice Satellite > Wake Word) and remote admin on, with this kiosk's admin password below.",
+  "author": "Joseph Yancey",
+  "license": "Apache-2.0",
+  "headless": true,
+  "capabilities": ["host.read"],
+  "settings": [
+    {
+      "key": "adminPassword",
+      "type": "secret",
+      "title": "Remote admin password",
+      "default": "",
+      "description": "This kiosk's remote admin password. The plugin uses it to ask the kiosk itself to listen for \"stop\" and to hang up."
+    },
+    {
+      "key": "adminPort",
+      "type": "number",
+      "title": "Remote admin port",
+      "default": 2324,
+      "min": 1,
+      "max": 65535,
+      "step": 1,
+      "input": "field",
+      "group": "Advanced"
+    },
+    {
+      "key": "adminHttps",
+      "type": "boolean",
+      "title": "Remote admin uses HTTPS",
+      "default": false,
+      "group": "Advanced"
+    }
+  ],
+  "commands": []
+}
