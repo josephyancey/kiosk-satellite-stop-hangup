@@ -69,4 +69,4 @@ The SDK sources in `sdk/` and the build tools in `tools/` come from the [Kiosk S
 
 ## License
 
-[Apache-2.0](LICENSE). Kiosk Satellite has its own application license.
+[Apache-2.0](LICENSE). Kiosk Satellite has its own application license. The handset in the icon is `call_end` from Google's [Material Icons](https://github.com/google/material-design-icons), also Apache-2.0.

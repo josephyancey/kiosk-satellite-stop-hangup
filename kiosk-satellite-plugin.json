@@ -11,6 +11,7 @@
   "author": "Joseph Yancey",
   "license": "Apache-2.0",
   "headless": true,
+  "icon": "icon.png",
   "capabilities": ["host.read"],
   "settings": [
     {
