@@ -40,7 +40,7 @@ With a fleet, install it on the leader and add it to the profile's **Plugins** r
 
 Kiosk Satellite only listens for the stop word while something asks it to, such as a ringing timer, and the plugin API has no way to ask, or to hang up a call. Remote admin has both, as the commands `setStopWordArmed` and `intercomHangup`. So the plugin:
 
-1. Follows the intercom state. When a call is placed, goes live or an announcement starts, it asks this kiosk to listen for the stop word, and stops asking when the call ends.
+1. Follows the intercom state. When a call is placed, goes live or an announcement starts, it asks this kiosk to listen for the stop word, and stops asking when the call ends. A request that fails is sent again until the kiosk has it, so the stop word is never left listening after a call. If the dashboard reloads during a call, which turns the stop word off, it asks again.
 2. Hangs the call up when the stop word is heard during a call.
 
 Both requests go to remote admin on this kiosk itself, at `127.0.0.1`, logged in with a token from the password. Nothing leaves the device.
@@ -48,7 +48,8 @@ Both requests go to remote admin on this kiosk itself, at `127.0.0.1`, logged in
 ## Limits
 
 - It depends on remote admin being on, and on the two commands above, which are not part of the documented plugin API. A future Kiosk Satellite release could change them; the status line then shows the error, and calls keep working as before.
-- Changing the admin password needs the new one entered here too.
+- Keep remote admin on while the plugin is enabled. With it off, another app on the device could take its port and be sent the password.
+- Changing the admin password needs the new one entered here too. After a wrong password the plugin stops trying, so remote admin does not lock this kiosk out, until you enter a new one or the plugin restarts.
 
 ## Build and test
 

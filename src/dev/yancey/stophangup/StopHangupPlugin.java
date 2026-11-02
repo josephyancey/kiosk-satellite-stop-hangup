@@ -12,14 +12,16 @@ import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 import me.jxl.kiosk.plugins.KioskPlugin;
@@ -34,44 +36,73 @@ import me.jxl.kiosk.plugins.PluginHost;
 public final class StopHangupPlugin implements KioskPlugin {
     /** The intercom states a call can be hung up in, the same ones the hang-up button ends. */
     static final Set<String> HANGUP_STATES = new HashSet<>(Arrays.asList("calling", "in_call", "broadcasting", "listening"));
-    static final String HOLDER = "stop-hangup-plugin";
+    static final String HOLDER_PREFIX = "stop-hangup-plugin-";
+    /** setStopWordArmed answers data false when the kiosk has no stop word to listen with. */
+    static final Pattern STOP_WORD_OFF = Pattern.compile("\"data\"\\s*:\\s*false");
+    static final Pattern TOKEN = Pattern.compile("\"token\"\\s*:\\s*\"([^\"]+)\"");
+    static final String STOP_WORD_OFF_STATUS = "Turn on Stop word interruption under Voice Satellite > Wake Word.";
+    static final long RETRY_SECONDS = 30;
+    /** At most one re-arm per this long when the kiosk's wake word state changes during a call. */
+    static final long REARM_MILLIS = 5000;
 
+    /**
+     * This instance's name in the kiosk's list of who wants the stop word, so a restarted plugin's
+     * arm never races the old instance's disarm.
+     */
+    private final String holder = HOLDER_PREFIX + Long.toHexString(new SecureRandom().nextLong() & 0xffffffffL);
     private PluginHost host;
-    private ExecutorService worker;
+    private ScheduledThreadPoolExecutor worker;
     private String password = "";
     private int port = 2324;
     private boolean https;
     private String token = "";
+    /** Set when remote admin turned the password down: no more logins until the settings change. */
+    private boolean rejected;
     private String state = "idle";
+    /** Whether the plugin wants the stop word armed, from the intercom state. */
     private boolean armed;
+    /** What the kiosk last confirmed. Anything else gets sent again until it matches. */
+    private boolean kioskArmed;
+    private boolean retrying;
+    private long lastRearm;
+    /** The kiosk has no stop word to listen with: Stop word interruption is off. */
+    private boolean stopWordOff;
 
     @Override
     public synchronized void start(PluginHost host, Map<String, Object> settings) {
         this.host = host;
-        worker = Executors.newSingleThreadExecutor(r -> {
+        worker = new ScheduledThreadPoolExecutor(1, r -> {
             Thread t = new Thread(r, "stop-hangup");
             t.setDaemon(true);
             return t;
         });
+        worker.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         configure(settings);
         host.subscribe("intercom.state");
         host.subscribe("stopword.detected");
+        host.subscribe("wakeword.state");
         host.executeCommand("getIntercomState", Collections.<String, Object>emptyMap(), (ok, data, error) -> {
             if (ok && data instanceof Map) onState(String.valueOf(((Map<?, ?>) data).get("state")));
         });
+        readWakeWord();
     }
 
     @Override
     public synchronized void configure(Map<String, Object> settings) {
-        String nextPassword = String.valueOf(settings.get("adminPassword"));
-        int nextPort = ((Number) settings.get("adminPort")).intValue();
+        Object p = settings.get("adminPassword");
+        Object n = settings.get("adminPort");
+        String nextPassword = p instanceof String ? (String) p : "";
+        int nextPort = n instanceof Number ? ((Number) n).intValue() : 2324;
         boolean nextHttps = Boolean.TRUE.equals(settings.get("adminHttps"));
-        if (!nextPassword.equals(password) || nextPort != port || nextHttps != https) token = "";
+        // A token outlives a password change, so it is kept for a disarm still owed; the new password is checked below.
+        if (nextPort != port || nextHttps != https) token = "";
+        boolean changed = !nextPassword.equals(password) || nextPort != port || nextHttps != https;
+        if (changed) rejected = false;
         password = nextPassword;
         port = nextPort;
         https = nextHttps;
         if (password.isEmpty()) host.status("Enter this kiosk's remote admin password.", true);
-        else if (token.isEmpty()) submit(() -> run(null)); // log in now, so a wrong password shows before a call
+        else if (changed || token.isEmpty()) submit(this::verify); // log in now, so a wrong password shows before a call
     }
 
     @Override
@@ -82,7 +113,15 @@ public final class StopHangupPlugin implements KioskPlugin {
         if ("ks.intercom.state".equals(event)) {
             onState(String.valueOf(payload.get("state")));
         } else if ("ks.stopword.detected".equals(event) && armed && HANGUP_STATES.contains(state)) {
-            submit(() -> run("intercomHangup"));
+            submit(this::hangup);
+        } else if ("ks.wakeword.state".equals(event)) {
+            readWakeWord();
+            // A dashboard reload turns the stop word off without asking its holders: arm again.
+            long now = System.currentTimeMillis();
+            if (armed && now - lastRearm >= REARM_MILLIS) {
+                lastRearm = now;
+                submit(() -> sync(true));
+            }
         }
     }
 
@@ -91,88 +130,159 @@ public final class StopHangupPlugin implements KioskPlugin {
         boolean want = HANGUP_STATES.contains(next);
         if (want == armed) return;
         armed = want;
-        Map<String, Object> params = new java.util.LinkedHashMap<>();
-        params.put("armed", want);
-        params.put("holder", HOLDER);
-        submit(() -> run("setStopWordArmed", params));
+        submit(() -> sync(false));
+    }
+
+    /** Whether Stop word interruption is on, for the status line. */
+    private synchronized void readWakeWord() {
+        if (host == null) return;
+        host.executeCommand("getWakeWordState", Collections.<String, Object>emptyMap(), (ok, data, error) -> {
+            if (!ok || !(data instanceof Map)) return;
+            Object available = ((Map<?, ?>) data).get("stopWordAvailable");
+            if (available instanceof Boolean) {
+                synchronized (this) {
+                    stopWordOff = !(Boolean) available;
+                }
+            }
+            refresh();
+        });
     }
 
     @Override
     public synchronized void stop() {
-        if (armed && !token.isEmpty()) {
-            Map<String, Object> params = new java.util.LinkedHashMap<>();
-            params.put("armed", false);
-            params.put("holder", HOLDER);
-            String t = token;
-            // Disarm on the way out, without holding up the stop.
-            Thread off = new Thread(() -> { try { command(t, "setStopWordArmed", params); } catch (IOException ignored) {} });
-            off.setDaemon(true);
-            off.start();
+        if (worker != null) {
+            if ((armed || kioskArmed) && (!token.isEmpty() || (!password.isEmpty() && !rejected))) {
+                // Disarm on the way out without holding up the stop, queued so it lands after an arm still on its way.
+                worker.execute(() -> {
+                    try {
+                        call("setStopWordArmed", arming(false));
+                    } catch (IOException ignored) {
+                    }
+                });
+            }
+            worker.shutdown();
         }
         armed = false;
-        if (worker != null) worker.shutdownNow();
         worker = null;
         host = null;
+    }
+
+    Map<String, Object> arming(boolean on) {
+        Map<String, Object> params = new LinkedHashMap<>();
+        params.put("armed", on);
+        params.put("holder", holder);
+        return params;
     }
 
     private synchronized void submit(Runnable r) {
         if (worker != null) worker.execute(r);
     }
 
-    private void run(String command) {
-        run(command, Collections.<String, Object>emptyMap());
+    /** Logs in with the password as it is now, then catches the kiosk up on anything owed. */
+    private void verify() {
+        try {
+            synchronized (this) {
+                if (host == null || password.isEmpty()) return;
+            }
+            login();
+            report(null);
+            sync(false);
+        } catch (IOException e) {
+            report(e.getMessage());
+        }
     }
 
-    /** Runs a command on this kiosk, logging in first when there is no token yet. */
-    private void run(String command, Map<String, Object> params) {
-        String t;
+    /** Sends the arming the plugin wants when the kiosk hasn't confirmed it (or always, when forced), retrying on failure. */
+    private void sync(boolean force) {
+        boolean want;
         synchronized (this) {
-            if (host == null || password.isEmpty()) return;
-            t = token;
+            retrying = false;
+            if (host == null || (!force && armed == kioskArmed)) return;
+            want = armed;
         }
         try {
-            if (t.isEmpty()) t = login();
-            if (command == null) {
-                ok();
-                return;
+            Response r = call("setStopWordArmed", arming(want));
+            if (r.code != 200) throw new IOException("setStopWordArmed answered HTTP " + r.code + ".");
+            synchronized (this) {
+                kioskArmed = want;
+                if (want) stopWordOff = STOP_WORD_OFF.matcher(r.body).find();
             }
-            int code = command(t, command, params);
-            if (code == 401) { // the token was turned down: log in once more
-                t = login();
-                code = command(t, command, params);
-            }
-            if (code != 200) throw new IOException(command + " answered HTTP " + code);
-            if ("intercomHangup".equals(command)) log("Heard the stop word: hung up the call");
-            ok();
+            report(null);
+            sync(false); // the intercom state may have moved on meanwhile
         } catch (IOException e) {
-            fail(e.getMessage());
+            report(e.getMessage());
+            synchronized (this) {
+                if (worker != null && !retrying && armed != kioskArmed) {
+                    retrying = true;
+                    worker.schedule(() -> sync(false), RETRY_SECONDS, TimeUnit.SECONDS);
+                }
+            }
         }
+    }
+
+    private void hangup() {
+        try {
+            Response r = call("intercomHangup", Collections.<String, Object>emptyMap());
+            // A 400 is "no call": it ended on its own as the stop word was heard.
+            if (r.code != 200 && r.code != 400) throw new IOException("intercomHangup answered HTTP " + r.code + ".");
+            if (r.code == 200) log("Heard the stop word: hung up the call");
+            report(null);
+        } catch (IOException e) {
+            report(e.getMessage());
+        }
+    }
+
+    /** Posts a command, logging in first when there is no token and once more when the token is turned down. */
+    private Response call(String command, Map<String, Object> params) throws IOException {
+        Response r = command(token(), command, params);
+        if (r.code == 401) {
+            synchronized (this) {
+                token = "";
+            }
+            r = command(token(), command, params);
+        }
+        return r;
+    }
+
+    private String token() throws IOException {
+        synchronized (this) {
+            if (!token.isEmpty()) return token;
+            if (password.isEmpty()) throw new IOException("Enter this kiosk's remote admin password.");
+            if (rejected) throw new IOException("The remote admin password was turned down.");
+        }
+        return login();
     }
 
     private String login() throws IOException {
         String body;
         synchronized (this) {
-            body = "{\"password\":" + quote(password) + ",\"ttl_days\":3650}";
+            body = "{\"password\":" + quote(password) + "}";
         }
         Response r = post("/api/login", null, body);
-        Matcher m = Pattern.compile("\"token\"\\s*:\\s*\"([^\"]+)\"").matcher(r.body);
-        if (r.code != 200 || !m.find()) {
-            throw new IOException(r.code == 401 || r.code == 403 ? "The remote admin password was turned down." : "Remote admin login answered HTTP " + r.code + ".");
+        if (r.code == 401 || r.code == 403) {
+            // Stop trying: remote admin locks 127.0.0.1 out after five wrong passwords in five minutes.
+            synchronized (this) {
+                rejected = true;
+            }
+            throw new IOException("The remote admin password was turned down.");
         }
+        if (r.code == 429) throw new IOException("Remote admin is refusing logins after too many wrong passwords. Try again in five minutes.");
+        Matcher m = TOKEN.matcher(r.body);
+        if (r.code != 200 || !m.find()) throw new IOException("Remote admin login answered HTTP " + r.code + ".");
         synchronized (this) {
             token = m.group(1);
         }
         return m.group(1);
     }
 
-    private int command(String t, String name, Map<String, Object> params) throws IOException {
+    private Response command(String t, String name, Map<String, Object> params) throws IOException {
         StringBuilder b = new StringBuilder("{");
         for (Map.Entry<String, Object> e : params.entrySet()) {
             if (b.length() > 1) b.append(',');
             b.append(quote(e.getKey())).append(':');
             b.append(e.getValue() instanceof String ? quote((String) e.getValue()) : String.valueOf(e.getValue()));
         }
-        return post("/api/commands/" + name, t, b.append('}').toString()).code;
+        return post("/api/commands/" + name, t, b.append('}').toString());
     }
 
     static final class Response {
@@ -209,8 +319,11 @@ public final class StopHangupPlugin implements KioskPlugin {
                 in.close();
             }
             return new Response(code, new String(b.toByteArray(), StandardCharsets.UTF_8));
+        } catch (SSLException e) {
+            throw new IOException("Remote admin on port " + p + " doesn't answer HTTPS. Check Remote admin uses HTTPS.");
         } catch (IOException e) {
-            throw new IOException("Cannot reach remote admin on port " + p + (secure ? " (HTTPS)" : "") + ". Is it on?");
+            throw new IOException("Cannot reach remote admin on port " + p + (secure ? " over HTTPS" : "")
+                    + ". Is it on, and does Remote admin uses HTTPS match?");
         } finally {
             c.disconnect();
         }
@@ -242,12 +355,22 @@ public final class StopHangupPlugin implements KioskPlugin {
         return b.append('"').toString();
     }
 
-    private synchronized void ok() {
-        if (host != null) host.status("Ready. Say \"stop\" during a call to hang up.", false);
+    /** The last error, or null after a success; kept so a stop word warning can show over Ready. */
+    private String lastError;
+
+    private synchronized void report(String error) {
+        lastError = error;
+        refresh();
     }
 
-    private synchronized void fail(String why) {
-        if (host != null) host.status(why, true);
+    private synchronized void refresh() {
+        if (host == null) return;
+        if (password.isEmpty()) host.status("Enter this kiosk's remote admin password.", true);
+        else if (lastError != null) host.status(lastError, true);
+        // Still working on a token from before the password changed: say the new one is wrong.
+        else if (rejected) host.status("The remote admin password was turned down.", true);
+        else if (stopWordOff) host.status(STOP_WORD_OFF_STATUS, true);
+        else if (!token.isEmpty()) host.status("Ready. Say \"stop\" during a call to hang up.", false);
     }
 
     private synchronized void log(String message) {

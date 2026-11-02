@@ -3,7 +3,7 @@
   "apiVersion": 1,
   "id": "stop-hangup",
   "name": "Stop Hangs Up Calls",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAndroidSdk": 24,
   "minAppVersion": "2026.10.45",
   "entryClass": "dev.yancey.stophangup.StopHangupPlugin",
