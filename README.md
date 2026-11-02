@@ -1,6 +1,6 @@
 # Stop Hangs Up Calls
 
-A [Kiosk Satellite](https://github.com/jxlarrea/kiosk-satellite) plugin that ends an intercom call when you say "stop". Say it on its own during a call and the call hangs up. Saying it in the middle of a sentence does nothing, and the other kiosk saying "stop" does not hang up your end.
+A [Kiosk Satellite](https://github.com/jxlarrea/kiosk-satellite) plugin that ends an intercom call when you say "stop". Say it on its own during a call and the call hangs up. Saying it in the middle of a sentence does nothing. Only this kiosk's microphone counts, so "stop" coming through its speaker from the other end doesn't trigger it here. If the other kiosk runs the plugin too, someone saying "stop" there hangs it up, which ends the call for both of you.
 
 It hangs up a call you are placing, a live call, and an announcement going out from or playing on this kiosk: the same calls the hang-up button ends. Outside a call, "stop" does what it always does.
 
